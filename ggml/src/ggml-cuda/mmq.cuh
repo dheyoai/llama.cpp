@@ -2544,8 +2544,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int blocks_per_iter = MMQ_ITER_K / qk;
 
     float sum[mmq_x*mmq_y / (nwarps*WARP_SIZE)] = {0.0f};
+    long long start_time, end_time;
+    long long total_load_cycles = 0;
+    long long total_matmul_cycles = 0;
+    long long total_writeback_cycles = 0;
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        start_time = clock64();
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
 
         {
@@ -2557,13 +2562,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 tile_y[l] = by0[l];
             }
         }
-
         __syncthreads();
+        end_time = clock64();
+        total_load_cycles += (end_time - start_time);
 
+        start_time = clock64();
         vec_dot(tile_x, tile_y, sum, 0);
-
         __syncthreads();
+        end_time = clock64();
+        
+        total_matmul_cycles += (end_time - start_time);
 
+
+        start_time = clock64();
         {
             const int * by0 = y + ncols_y*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 1*sizeof(block_q8_1_mmq)/sizeof(int));
 #pragma unroll
@@ -2575,16 +2586,30 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         }
 
         __syncthreads();
+        end_time = clock64();
+        total_load_cycles += (end_time - start_time);
 
+        start_time = clock64();
         vec_dot(tile_x, tile_y, sum, WARP_SIZE);
 
         __syncthreads();
+        end_time = clock64();
+        total_matmul_cycles += (end_time - start_time);
     }
-
+    start_time = clock64();
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
         write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
+     __syncthreads();
+    end_time = clock64();
+    total_writeback_cycles = (end_time - start_time); // Ensure all threads have finished their work before printing.
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        // This printf will be visible if the correct environment variable is set.
+        // It reports the total cycles spent in each phase *by this thread block*.
+          printf("[KERNEL_TIMER] blk_id=%u, type_enum=%d | Phase 2 (Load Tiles): %lld cycles | Phase 3 (Matmul): %lld cycles | Phase 4 (Writeback): %lld cycles\n",
+               blockIdx.x, (int)type, total_load_cycles, total_matmul_cycles, total_writeback_cycles);
     }
 }
 
