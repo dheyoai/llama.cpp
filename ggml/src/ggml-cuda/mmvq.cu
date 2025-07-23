@@ -1,4 +1,4 @@
-
+#include "mmvq.cuh"
 
 #include "ggml.h"
 #include <vector>
@@ -6,7 +6,7 @@
 #include <string>
 #include <stdexcept>
 #include <hip/hip_runtime.h>
-#include "mmvq.cuh"
+#define ENABLE_MMVQ_INTERNAL_PROFILING
 #ifndef HIP_CHECK
 #define HIP_CHECK(cmd)                                          \
 do {                                                            \
@@ -23,7 +23,15 @@ do {                                                            \
 #include "vecdotq.cuh"
 
 #include <cstdint>
-
+#ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    #define PROFILE_KERNEL_ARG   , long long * __restrict__ timing_buffer
+    #define PROFILE_DISPATCH_ARG , long long * timing_buffer // For C++ function signatures
+    #define PROFILE_PASS_ARG     , timing_buffer             // For passing the variable in calls
+#else
+    #define PROFILE_KERNEL_ARG
+    #define PROFILE_DISPATCH_ARG
+    #define PROFILE_PASS_ARG
+#endif
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -153,21 +161,18 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     }
     return 1;
 }
-
 template <ggml_type type, int ncols_dst>
 __launch_bounds__(calc_nwarps(ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int ncols_x, const int nchannels_y, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
-
-    // INSTRUMENTATION: Timer variables
-    long long start_time, end_time;
-    long long total_compute_cycles = 0;
-    long long total_reduce_cycles = 0;
-
-    // Original logic for setting up parameters
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst
+        PROFILE_KERNEL_ARG 
+) {
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    long long start_time, end_time, compute_cycles, reduce_cycles;
+    #endif
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
@@ -194,34 +199,42 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    // --- END OF UNCHANGED ORIGINAL LOGIC ---
 
-    // INSTRUMENTATION: Phase 1: Main Compute Loop
-    __syncthreads();
+
+    // [INSTRUMENTATION] Start timing the first phase: the main compute loop.
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    __syncthreads(); // Synchronize all threads in the block before starting the timer.
     start_time = clock64();
+    #endif
 
+    // --- START OF UNCHANGED CORE COMPUTE LOGIC ---
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (tid % (qi/vdr));
 
-#pragma unroll
+        #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
+            #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
             }
         }
     }
-    __syncthreads();
+    
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    __syncthreads(); // Ensure all compute is finished before stopping the timer.
     end_time = clock64();
-    total_compute_cycles = (end_time - start_time);
+    compute_cycles = end_time - start_time;
+    start_time = clock64(); // Start timer for the next phase.
+    #endif
 
-    // INSTRUMENTATION: Phase 2: Reduction & Writeback
-    start_time = clock64();
+    // --- START OF UNCHANGED CORE REDUCTION LOGIC ---
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
     if (threadIdx.y > 0) {
-#pragma unroll
+        #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
+            #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
             }
@@ -234,11 +247,11 @@ static __global__ void mul_mat_vec_q(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
-#pragma unroll
+    #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
+        #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
-#pragma unroll
+            #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
             }
@@ -249,15 +262,18 @@ static __global__ void mul_mat_vec_q(
         }
     }
     
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
     end_time = clock64();
-    total_reduce_cycles = (end_time - start_time);
+    reduce_cycles = end_time - start_time;
     
-    if (threadIdx.x == 0) {
-        printf("[MMVQ_KERNEL_TIMER] blk_id=(%u,%u,%u), type_enum=%d | Phase 1 (Compute): %lld cycles | Phase 2 (Reduction & Write): %lld cycles\n",
-               blockIdx.x, blockIdx.y, blockIdx.z, (int)type, total_compute_cycles, total_reduce_cycles);
+    if (tid == 0) {
+        int block_id = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+        timing_buffer[block_id * 2 + 0] = compute_cycles;
+        timing_buffer[block_id * 2 + 1] = reduce_cycles;
     }
+    #endif
 }
-
+// Add this function back into your file
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_y, const int nsamples_y,
         const int warp_size, const mmvq_parameter_table_id table_id) {
@@ -266,7 +282,6 @@ static std::pair<dim3, dim3> calc_launch_params(
     const dim3 block_dims(warp_size, calc_nwarps(ncols_dst, table_id), 1);
     return {block_nums, block_dims};
 }
-
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, float * dst,
@@ -275,7 +290,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        hipStream_t stream) {
+        hipStream_t stream PROFILE_DISPATCH_ARG) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -285,17 +300,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
     GGML_ASSERT(!ids || ncols_dst == 1);
-
-    #define LAUNCH_KERNEL(NCOLS) \
-        do { \
-            constexpr int c_ncols_dst = NCOLS; \
-            std::pair<dim3, dim3> dims = calc_launch_params(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id); \
-            mul_mat_vec_q<type, c_ncols_dst><<<dims.first, dims.second, 0, stream>>> \
-                (vx, vy, ids, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, \
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst); \
-        } while (0)
-
+#define LAUNCH_KERNEL(NCOLS) \
+    do { \
+        constexpr int c_ncols_dst = NCOLS; \
+        std::pair<dim3, dim3> dims = calc_launch_params(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id); \
+        hipLaunchKernelGGL((mul_mat_vec_q<type, c_ncols_dst>), dims.first, dims.second, 0, stream, \
+            vx, vy, ids, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, \
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, \
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst \
+            PROFILE_PASS_ARG); \
+    } while (0)
     switch (ncols_dst) {
         case 1: LAUNCH_KERNEL(1); break;
         case 2: LAUNCH_KERNEL(2); break;
@@ -309,7 +323,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
     #undef LAUNCH_KERNEL
 }
-
 static void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -317,15 +330,18 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        hipStream_t stream) {
+        hipStream_t stream PROFILE_DISPATCH_ARG) {
+    
+    // FIX: The semicolon at the end of the function call has been removed.
     #define MMVQ_CASE(TYPE) \
         case TYPE: \
             mul_mat_vec_q_switch_ncols_dst<TYPE> \
                 (vx, vy, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst, \
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, \
-                 stream); \
+                 stream PROFILE_PASS_ARG); \
             break
+
     switch (type_x) {
         MMVQ_CASE(GGML_TYPE_Q4_0); MMVQ_CASE(GGML_TYPE_Q4_1); MMVQ_CASE(GGML_TYPE_Q5_0); MMVQ_CASE(GGML_TYPE_Q5_1);
         MMVQ_CASE(GGML_TYPE_Q8_0); MMVQ_CASE(GGML_TYPE_Q2_K); MMVQ_CASE(GGML_TYPE_Q3_K); MMVQ_CASE(GGML_TYPE_Q4_K);
@@ -339,12 +355,21 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    // --- Original Host Setup (Unchanged) ---
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
     hipStream_t stream = ctx.stream();
+
+    // --- [ADDED CHANGE] Get GPU clock frequency for cycle calculation ---
+    int device_id;
+    HIP_CHECK(hipGetDevice(&device_id));
+    hipDeviceProp_t props;
+    HIP_CHECK(hipGetDeviceProperties(&props, device_id));
+    // props.clockRate is in kHz, so multiply by 1000 to get Hz (cycles per second)
+    const double gpu_clock_hz = (double)props.clockRate * 1000.0;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -395,7 +420,12 @@ void ggml_cuda_mul_mat_vec_q(
     HIP_CHECK(hipEventRecord(timer_stop, stream));
     HIP_CHECK(hipEventSynchronize(timer_stop));
     HIP_CHECK(hipEventElapsedTime(&gpu_time_ms, timer_start, timer_stop));
-    printf("[HIP_MMVQ_TIMER] quantize_row_q8_1 (type %s) took: %f ms\n", ggml_type_name(src0->type), gpu_time_ms);
+    
+    // --- [ADDED CHANGE] Calculate and print cycles for the quantization kernel ---
+    long long quantize_cycles = (long long)(gpu_time_ms / 1000.0 * gpu_clock_hz);
+    printf("[HIP_MMVQ_TIMER] quantize_row_q8_1 (type %s) took: %f ms (%lld cycles)\n",
+           ggml_type_name(src0->type), gpu_time_ms, quantize_cycles);
+
     HIP_CHECK(hipEventDestroy(timer_start));
     HIP_CHECK(hipEventDestroy(timer_stop));
     
@@ -417,6 +447,19 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_dst = ids ? s1   : s2;
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
+    std::pair<dim3, dim3> dims = calc_launch_params(ncols_dst, ne01, nchannels_dst, ne3, warp_size, table_id);
+    const size_t num_blocks = (size_t)dims.first.x * dims.first.y * dims.first.z;
+    const size_t timing_buffer_size = num_blocks * 2 * sizeof(long long);
+    long long *d_timing_buffer = nullptr;
+    if (num_blocks > 0) {
+        HIP_CHECK(hipMalloc(&d_timing_buffer, timing_buffer_size));
+    }
+    #endif
+
     HIP_CHECK(hipEventCreate(&timer_start));
     HIP_CHECK(hipEventCreate(&timer_stop));
     HIP_CHECK(hipEventRecord(timer_start, stream));
@@ -425,17 +468,46 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1.get(), ids_d, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,                 stream);
+        ne03,              ne3,           s03, s13,              s3,                 stream
+        #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+        , d_timing_buffer
+        #endif
+    );
     HIP_CHECK(hipGetLastError());
 
     HIP_CHECK(hipEventRecord(timer_stop, stream));
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipEventElapsedTime(&gpu_time_ms, timer_start, timer_stop));
-    printf("[HIP_MMVQ_TIMER] MMVQ Kernel Exec (type %s, ncols_dst %lld) took: %f ms\n",
-           ggml_type_name(src0->type), (long long)ncols_dst, gpu_time_ms);
+
+    // --- [ADDED CHANGE] Calculate and print cycles for the main MMVQ kernel ---
+    long long kernel_exec_cycles = (long long)(gpu_time_ms / 1000.0 * gpu_clock_hz);
+    printf("[HIP_MMVQ_TIMER] MMVQ Kernel Exec (type %s, ncols_dst %lld) took: %f ms (%lld cycles)\n",
+           ggml_type_name(src0->type), (long long)ncols_dst, gpu_time_ms, kernel_exec_cycles);
+
     HIP_CHECK(hipEventDestroy(timer_start));
     HIP_CHECK(hipEventDestroy(timer_stop));
+
+    #ifdef ENABLE_MMVQ_INTERNAL_PROFILING
+    if (num_blocks > 0 && d_timing_buffer != nullptr) {
+        printf("--- [MMVQ_KERNEL_ANALYSIS] ---\n");
+        std::vector<long long> h_timing_buffer(num_blocks * 2);
+        HIP_CHECK(hipMemcpy(h_timing_buffer.data(), d_timing_buffer, timing_buffer_size, hipMemcpyDeviceToHost));
+        HIP_CHECK(hipFree(d_timing_buffer));
+
+        double total_compute = 0.0, total_reduce = 0.0;
+        for (size_t i = 0; i < num_blocks; ++i) {
+            total_compute += h_timing_buffer[i * 2 + 0];
+            total_reduce  += h_timing_buffer[i * 2 + 1];
+        }
+
+        printf("  Total blocks launched: %zu\n", num_blocks);
+        printf("  Avg Compute Phase:     %.0f cycles\n", total_compute / num_blocks);
+        printf("  Avg Reduction Phase:   %.0f cycles\n", total_reduce / num_blocks);
+        printf("-------------------------------\n");
+    }
+    #endif
 }
+
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
@@ -462,7 +534,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, stream);
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, stream,nullptr);
     HIP_CHECK(hipGetLastError());
 
     HIP_CHECK(hipEventRecord(timer_stop, stream));
