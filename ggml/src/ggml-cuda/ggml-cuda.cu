@@ -1582,7 +1582,7 @@ static void ggml_cuda_op_mul_mat(
 
         if (quantize_src1) {
             size_t src_1_ddq_size = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
-            if (quantize_src1 == quantize_mmq_q8_1_cuda) {
+            if (quantize_src1 == (quantize_cuda_t)quantize_mmq_q8_1_cuda) {
                 src_1_ddq_size += get_mmq_x_max_host(dev[id].cc)*sizeof(block_q8_1_mmq);
             }
             dev[id].src1_ddq = dev[id].src1_ddq_alloc.alloc(ctx.pool(id), src_1_ddq_size);
@@ -1638,7 +1638,7 @@ static void ggml_cuda_op_mul_mat(
                 const int64_t i02 = i0 % ne12;
 
                 size_t src1_ddq_i_offset = i0*ne11 * src1_padded_col_size*q8_1_ts/q8_1_bs;
-                if (quantize_src1 == quantize_mmq_q8_1_cuda) {
+                if (quantize_src1 == (quantize_cuda_t)quantize_mmq_q8_1_cuda) {
                     src1_ddq_i_offset += src1_col_0 * sizeof(block_q8_1_mmq);
                 } else {
                     src1_ddq_i_offset += src1_col_0 * src1_padded_col_size*q8_1_ts/q8_1_bs;
@@ -1662,7 +1662,7 @@ static void ggml_cuda_op_mul_mat(
                     if (id != ctx.device) {
                         if (quantize_src1) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
-                            if (quantize_src1 == quantize_mmq_q8_1_cuda) {
+                            if (quantize_src1 == (quantize_cuda_t)quantize_mmq_q8_1_cuda) {
                                 const size_t pitch = ne11*sizeof(block_q8_1_mmq);
                                 const size_t width = src1_ncols*sizeof(block_q8_1_mmq);
                                 const size_t height = src1_padded_col_size/(4*QK8_1);
