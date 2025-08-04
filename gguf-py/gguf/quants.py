@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Sequence
 from math import log2, ceil
+from .mx_packer import quantize_mx_interleaved_blocks
 
 from numpy.typing import DTypeLike
 
@@ -1267,3 +1268,32 @@ class IQ4_XS(__Quant, qtype=GGMLQuantizationType.IQ4_XS):
         qs = np.take_along_axis(kvalues, qs, axis=-1).astype(np.float32).reshape((n_blocks, -1, 32))
 
         return (dl * qs).reshape((n_blocks, -1))
+# --- Custom MX Quantization Classes ---
+
+class MX_E5M2_B32_INTERLEAVED(__Quant, qtype=GGMLQuantizationType.MX_E5M2_B32_INTERLEAVED):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        """
+        Takes (n_blocks, 32) float32 and returns (n_blocks, 34) uint8
+        in the interleaved [d, qs] format.
+        """
+        return quantize_mx_interleaved_blocks(blocks)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError(f"Dequantization for {cls.qtype.name} is not yet implemented")
+
+
+class MX_E5M2_B32_SPLIT(__Quant, qtype=GGMLQuantizationType.MX_E5M2_B32_SPLIT):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        """
+        Takes (n_blocks, 32) float32 and returns (n_blocks, 34) uint8.
+        The underlying data is conceptually planar ([all_qs][all_d]), but
+        this function reshapes it to fit the block-based framework.
+        """
+        return quantize_mx_split_blocks(blocks)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError(f"Dequantization for {cls.qtype.name} is not yet implemented")
